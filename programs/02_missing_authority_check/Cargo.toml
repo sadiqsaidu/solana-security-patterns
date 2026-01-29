@@ -1,0 +1,19 @@
+[package]
+name = "missing-authority-check"
+version = "0.1.0"
+description = "Educational demo of missing authority/signer check vulnerability"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "missing_authority_check"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.29.0"

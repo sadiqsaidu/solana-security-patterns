@@ -1,0 +1,46 @@
+{
+  "name": "solana-security-patterns",
+  "version": "1.0.0",
+  "description": "Educational Anchor-based security repository demonstrating real-world Solana vulnerabilities",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/solana-security-patterns"
+  },
+  "keywords": [
+    "solana",
+    "anchor",
+    "security",
+    "education",
+    "smart-contracts",
+    "blockchain"
+  ],
+  "author": "Superteam Security Education",
+  "license": "MIT",
+  "scripts": {
+    "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
+    "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check",
+    "test": "anchor test",
+    "test:01": "anchor test --skip-local-validator programs/01_missing_account_validation/tests/exploit.ts",
+    "test:02": "anchor test --skip-local-validator programs/02_missing_authority_check/tests/exploit.ts",
+    "test:03": "anchor test --skip-local-validator programs/03_incorrect_pda_derivation/tests/exploit.ts",
+    "test:04": "anchor test --skip-local-validator programs/04_unsafe_cpi_token_transfer/tests/exploit.ts",
+    "test:05": "anchor test --skip-local-validator programs/05_integer_overflow_state_bug/tests/exploit.ts",
+    "build": "anchor build"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.29.0",
+    "@solana/spl-token": "^0.3.9",
+    "@solana/web3.js": "^1.87.6"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/chai": "^4.3.11",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.10.5",
+    "chai": "^4.3.10",
+    "mocha": "^10.2.0",
+    "prettier": "^3.1.1",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^5.3.3"
+  }
+}

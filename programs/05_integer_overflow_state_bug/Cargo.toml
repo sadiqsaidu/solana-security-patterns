@@ -1,0 +1,19 @@
+[package]
+name = "integer-overflow-state-bug"
+version = "0.1.0"
+description = "Educational demo of integer overflow and state bug vulnerabilities"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "integer_overflow_state_bug"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.29.0"
