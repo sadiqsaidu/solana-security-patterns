@@ -1,146 +1,235 @@
 # 01 - Missing Account Validation
 
-## Vulnerability Name
-**Missing Account Validation / Unverified Account Ownership**
+## Overview
 
-## Summary
+This module demonstrates one of the most critical and recurring vulnerabilities in Solana programs: **Missing Account Validation**. When programs accept accounts without verifying ownership, type discriminators, or PDA derivation, attackers can substitute malicious data to hijack program logic.
 
-This vulnerability occurs when a program accepts accounts without verifying that they:
-1. Are owned by the expected program
-2. Contain the expected data structure (discriminator)
-3. Were derived from expected seeds (for PDAs)
+---
 
-An attacker can exploit this by passing fake accounts with arbitrary data, causing the program to operate on malicious data while affecting legitimate accounts.
+## The Vulnerability
 
-## Vulnerable Behavior
+### Why This Matters
 
-The `vulnerable_withdraw` instruction uses `AccountInfo` instead of Anchor's `Account<'info, Vault>` type:
+On Solana, the **caller controls which accounts are passed** to a program. Unlike traditional systems where data comes from trusted internal sources, Solana programs receive all inputs externally. This design grants attackers significant control over the data a program operates on.
+
+A program must independently verify:
+
+| Check | Purpose |
+|-------|---------|
+| **Owner** | Confirms the account is owned by the expected program |
+| **Discriminator** | Ensures the account data is the expected type |
+| **PDA Derivation** | Validates the account was derived with correct seeds |
+| **Data Integrity** | Verifies stored values match expected relationships |
+
+Without these checks, an attacker can craft fake accounts with arbitrary data and trick the program into trusting them.
+
+---
+
+## Program Architecture
+
+This demo implements a simple SOL vault with four instructions:
+
+| Instruction | Description |
+|-------------|-------------|
+| `initialize_vault` | Creates a per-user `Vault` account storing metadata and a `vault_pda` holding SOL |
+| `deposit` | Transfers SOL from the owner into the `vault_pda` |
+| `withdraw_insecure` | **Vulnerable** - Withdraws SOL without proper account validation |
+| `withdraw_secure` | **Secure** - Withdraws SOL with full Anchor validation |
+
+---
+
+## Vulnerability Analysis
+
+### The Insecure Pattern
+
+The `withdraw_insecure` instruction accepts raw `AccountInfo` types and deserializes without validation:
 
 ```rust
-// ❌ VULNERABLE: Accepts ANY account
-pub vault: AccountInfo<'info>,
+#[derive(Accounts)]
+pub struct WithdrawInsecure<'info> {
+    // VULNERABLE: AccountInfo skips all Anchor safety checks
+    /// CHECK: Unsafe. Any account data can be passed here.
+    #[account(mut)] 
+    pub vault: AccountInfo<'info>,
+    
+    // VULNERABLE: No seeds check to verify PDA derivation
+    /// CHECK: Unsafe. No relationship to vault is enforced.
+    #[account(mut)]
+    pub vault_pda: AccountInfo<'info>,
+    
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
 ```
 
-This means:
-- **No ownership check**: The account could be owned by any program
-- **No discriminator check**: The data structure is not verified
-- **No PDA derivation check**: The account could be attacker-created
-
-The instruction then manually deserializes data and trusts whatever it finds:
+The instruction then performs unchecked deserialization:
 
 ```rust
-// ❌ Trusts user-supplied data blindly
-let vault = &ctx.accounts.vault;
-require!(vault.owner == ctx.accounts.withdrawer.key(), ...);
+// Manually deserialize without checking account ownership
+let vault_data = &mut ctx.accounts.vault.try_borrow_data()?;
+let vault = Vault::try_deserialize_unchecked(&mut &vault_data[..])?;
 ```
 
-### Attack Flow
+### What Goes Wrong
 
-1. **Attacker identifies target**: Victim's vault_pda contains 1 SOL
-2. **Attacker creates fake vault**: Account with `owner = attacker_pubkey`, `balance = 100 SOL`
-3. **Attacker calls vulnerable_withdraw** with:
-   - `vault` = fake vault (passes owner/balance checks)
-   - `vault_pda` = victim's real vault_pda (contains real SOL)
-4. **Result**: Checks pass on fake data, but real SOL is transferred to attacker
+| Missing Check | Consequence |
+|---------------|-------------|
+| No owner verification | Account may belong to a different program or the attacker |
+| No discriminator check | Data might not represent a `Vault` at all |
+| No PDA seeds validation | `vault_pda` can be any account, including a victim's PDA |
+| Unchecked deserialization | Attacker-crafted bytes are trusted as valid state |
 
-## Real-World Context
+---
 
-This vulnerability pattern appeared in several major Solana exploits:
+## Exploit Mechanism
 
-### Wormhole Bridge ($326M - February 2022)
-> "A signature verification flaw in Wormhole's Solana-side program allowed an attacker to forge a valid signature, bypassing Guardian validation."
+### Attack Prerequisites
+1. A victim has deposited SOL into their legitimate `vault_pda`
+2. The attacker knows the victim's public key (to locate their PDA)
 
-The attacker passed fake accounts that bypassed validation, similar to how our exploit passes a fake vault account.
+### Attack Steps
 
-### Cashio ($52.8M - March 2022)
-> "A vulnerability in Cashio's program collateral validation allowed an attacker to mint 2 billion CASH tokens using fake accounts with worthless collateral. The flaw was due to a missing validation of the mint field."
-
-The Cashio exploit is almost identical to our demonstration—the attacker created fake collateral accounts that the program trusted without proper verification.
-
-### Crema Finance ($8.8M - July 2022)
-> "A vulnerability in Crema Finance's CLMM allowed an attacker to create a fake tick account, bypassing owner verification."
-
-Again, fake accounts bypassing validation led to massive fund theft.
-
-## Fix Explanation
-
-The `secure_withdraw` instruction uses multiple layers of validation:
-
-### 1. Account Type Verification
-```rust
-// ✅ Account<'info, Vault> automatically verifies:
-//    - Account is owned by this program
-//    - Account has correct discriminator
-pub vault: Account<'info, Vault>,
 ```
+Step 1: Locate Target
+---------------------------------------------------------------
+Attacker finds a victim's vault_pda with deposited SOL
 
-### 2. PDA Seed Derivation
-```rust
-// ✅ Verifies the vault was derived from expected seeds
-#[account(
-    seeds = [b"vault", owner.key().as_ref()],
-    bump = vault.bump,
-)]
-```
+Step 2: Craft Fake Vault
+---------------------------------------------------------------
+Attacker creates an account with fabricated Vault data:
+  - owner = attacker's pubkey (passes authority check)
+  - balance = any amount (passes balance check)  
+  - bump = calculated to derive victim's vault_pda
 
-### 3. Relationship Validation
-```rust
-// ✅ Verifies vault.owner matches the provided owner account
-has_one = owner @ VaultError::UnauthorizedWithdrawal
-```
+Step 3: Call withdraw_insecure
+---------------------------------------------------------------
+Attacker invokes the instruction with:
+  - vault = fake vault account
+  - vault_pda = victim's real PDA (with actual SOL)
+  - authority = attacker (matches fake vault.owner)
 
-### 4. Corresponding PDA Verification
-```rust
-// ✅ Verifies vault_pda corresponds to the same owner
-#[account(
-    seeds = [b"vault_pda", owner.key().as_ref()],
-    bump
-)]
-pub vault_pda: SystemAccount<'info>,
+Step 4: Exploit Succeeds
+---------------------------------------------------------------
+Program trusts fake data -> derives valid PDA signer
+-> transfers victim's SOL to attacker
 ```
 
 ### Why This Works
 
-| Attack Vector | Vulnerable | Secure |
-|--------------|------------|--------|
-| Fake account with arbitrary data | ❌ Accepted | ✅ Rejected (ownership) |
-| Account owned by wrong program | ❌ Accepted | ✅ Rejected (discriminator) |
-| Mismatched vault/vault_pda | ❌ Accepted | ✅ Rejected (seeds) |
-| Wrong owner | ❌ Accepted | ✅ Rejected (has_one) |
+The program uses data from the unverified fake vault to derive PDA signer seeds:
 
-## Key Takeaway
-
-> **Never use `AccountInfo` for accounts containing program-specific data.**
-> 
-> Always use `Account<'info, T>` which automatically verifies:
-> - The account is owned by your program
-> - The account has the correct discriminator
-> - The account data deserializes correctly
-> 
-> Combine with `seeds`, `bump`, and `has_one` constraints for complete validation.
-
-### Security Checklist for Account Validation
-
-- [ ] Use `Account<'info, T>` instead of `AccountInfo` for program accounts
-- [ ] Add `seeds` constraint for all PDAs
-- [ ] Use `has_one` to verify account relationships
-- [ ] Validate that derived addresses (vault_pda) correspond to metadata accounts (vault)
-- [ ] Never trust user-supplied account data without verification
-
-## Running the Exploit Test
-
-```bash
-cd programs/01_missing_account_validation
-anchor test
+```rust
+let seeds = &[
+    b"vault_pda",
+    vault.owner.as_ref(),  // Attacker's pubkey from fake vault
+    &[vault.bump],          // Bump calculated to match victim's PDA
+];
 ```
 
-The test demonstrates:
-1. Setting up a victim's vault with 1 SOL
-2. The vulnerability in `vulnerable_withdraw` (accepts fake accounts)
-3. The security of `secure_withdraw` (rejects all attack vectors)
+If the attacker correctly calculates the bump that derives the victim's `vault_pda`, the CPI transfer succeeds.
+
+---
+
+## Secure Implementation
+
+The `withdraw_secure` instruction uses Anchor's built-in validation:
+
+```rust
+#[derive(Accounts)]
+pub struct WithdrawSecure<'info> {
+    // SECURE: Account wrapper validates Owner and Discriminator
+    #[account(
+        mut,
+        seeds = [b"vault", owner.key().as_ref()],
+        bump = vault.bump,
+        has_one = owner @ VaultError::Unauthorized
+    )]
+    pub vault: Account<'info, Vault>,
+    
+    // SECURE: Seeds constraint validates PDA derivation
+    #[account(
+        mut,
+        seeds = [b"vault_pda", owner.key().as_ref()],
+        bump
+    )]
+    pub vault_pda: SystemAccount<'info>,
+    
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+```
+
+### Security Layers
+
+| Constraint | Protection |
+|------------|------------|
+| `Account<'info, Vault>` | Verifies program ownership + 8-byte discriminator |
+| `seeds = [...]` | Ensures PDA is derived from expected seeds |
+| `bump = vault.bump` | Confirms stored bump matches derivation |
+| `has_one = owner` | Enforces `vault.owner == owner.key()` |
+
+---
+
+## Real-World Exploits
+
+Account validation failures have caused significant losses across the Solana ecosystem:
+
+### 2021
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Solend Auth Bypass (Aug 2021)** | $16K (mitigated) | Attacker bypassed admin checks by creating a new lending market and passing it as an account they controlled. This enabled unauthorized updates to reserve configurations, lowering liquidation thresholds and inflating bonuses. The flaw was in the `UpdateReserveConfig` function's insecure authentication check. |
+
+### 2022
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Wormhole Bridge (Feb 2022)** | $326M (reimbursed) | A signature verification flaw allowed attackers to forge Guardian signatures by bypassing account validation. The program failed to verify the authenticity of the signature account, enabling unauthorized minting of 120,000 wETH. |
+| **Cashio (Mar 2022)** | $52.8M | Missing validation of the `mint` field in the `saber_swap.arrow` account allowed attackers to pass fake collateral accounts with worthless tokens. The program trusted the unverified account data, enabling an "infinite mint glitch" of CASH tokens. |
+| **Crema Finance (Jul 2022)** | $8.8M | Attackers created a fake tick account that bypassed owner verification in the CLMM protocol. The program's failure to validate account ownership allowed manipulation of fee data, draining liquidity pools via flash loans. |
+| **Audius (Jul 2022)** | $6.1M | The governance program accepted malicious proposals without proper validation. Attackers exploited missing checks to reconfigure treasury permissions and drain funds. |
+
+### 2023
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Synthetify DAO (Oct 2023)** | $230K | Attackers exploited an inactive DAO by submitting governance proposals that bypassed validation. The token-based voting system lacked proper scrutiny mechanisms, allowing a malicious proposal to transfer treasury funds. |
+
+### 2025
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Loopscale (Apr 2025)** | $5.8M (recovered) | Oracle manipulation in the pricing mechanism for RateX PT collateral allowed attackers to inflate token values. The program failed to validate the integrity of price feed accounts, enabling undercollateralized loans. |
+
+### Pattern Analysis
+
+These exploits share common characteristics:
+
+1. **Trusting Caller-Provided Accounts** - Programs assumed passed accounts were legitimate
+2. **Missing Owner Checks** - Accounts weren't verified as program-owned
+3. **No Discriminator Validation** - Data type wasn't confirmed before deserialization
+4. **Insufficient Relationship Checks** - Connections between accounts weren't enforced
+
+---
+
+## Security Checklist
+
+When building Solana programs, verify each account:
+
+- [ ] Use `Account<'info, T>` instead of `AccountInfo` for program-owned data
+- [ ] Apply `seeds` + `bump` constraints for all PDA accounts
+- [ ] Use `has_one` or explicit key comparisons for account relationships
+- [ ] Prefer `Program<'info, T>` for CPI target programs
+- [ ] Avoid `try_deserialize_unchecked` on untrusted accounts
+- [ ] Validate all fields that affect program logic (authority, mint, etc.)
+
+---
 
 ## Further Reading
 
 - [Anchor Book: Account Constraints](https://www.anchor-lang.com/docs/account-constraints)
 - [Solana Cookbook: PDAs](https://solanacookbook.com/core-concepts/pdas.html)
 - [Neodyme: Account Confusion](https://blog.neodyme.io/posts/solana_common_pitfalls)
+- [Helius: A Hitchhiker's Guide to Solana Program Security](https://www.helius.dev/blog/a-hitchhikers-guide-to-solana-program-security)
