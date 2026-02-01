@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Anchor build artifacts
+target/
+.anchor/
+
+# Solana
+test-ledger/
+.DS_Store
+
+# IDL (regenerated on build)
+*.so
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference documents (local only)
+solana_past_hacks.txt
+solana_security_guide.txt
