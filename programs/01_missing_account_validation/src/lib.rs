@@ -67,7 +67,7 @@ pub mod vault {
         Ok(())
     }
 
-    // ✅ SECURE: Anchor Validation
+    // SECURE: Anchor Validation
     // 1. `Account<Vault>` verifies Program ID ownership and Type Discriminator.
     // 2. `seeds` constraint ensures PDA matches the vault.
     // 3. `has_one` constraint enforces authority matches vault owner.
@@ -142,12 +142,12 @@ pub struct Deposit<'info> {
 
 #[derive(Accounts)]
 pub struct WithdrawInsecure<'info> {
-    // ⚠️ VULNERABLE: AccountInfo skips all Anchor safety checks
+    // VULNERABLE: AccountInfo skips all Anchor safety checks
     /// CHECK: Unsafe. Any account data can be passed here.
     #[account(mut)] 
     pub vault: AccountInfo<'info>,
     
-    // ⚠️ VULNERABLE: No seeds check to verify PDA derivation
+    // VULNERABLE: No seeds check to verify PDA derivation
     /// CHECK: Unsafe. No relationship to vault is enforced.
     #[account(mut)]
     pub vault_pda: AccountInfo<'info>,
@@ -159,7 +159,7 @@ pub struct WithdrawInsecure<'info> {
 
 #[derive(Accounts)]
 pub struct WithdrawSecure<'info> {
-    // ✅ SECURE: Account wrapper validates Owner and Discriminator
+    // SECURE: Account wrapper validates Owner and Discriminator
     #[account(
         mut,
         seeds = [b"vault", owner.key().as_ref()],
@@ -168,7 +168,7 @@ pub struct WithdrawSecure<'info> {
     )]
     pub vault: Account<'info, Vault>,
     
-    // ✅ SECURE: Seeds constraint validates PDA derivation
+    // SECURE: Seeds constraint validates PDA derivation
     #[account(
         mut,
         seeds = [b"vault_pda", owner.key().as_ref()],

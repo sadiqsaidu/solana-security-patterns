@@ -1,148 +1,226 @@
-# 02 - Missing Authority / Signer Check
+# 02 - Missing Authority Check
 
-## Vulnerability Name
-**Missing Authority Check / Signer Verification Bypass**
+## Overview
 
-## Summary
+This module demonstrates a critical vulnerability in Solana programs: **Missing Authority/Signer Check**. When programs verify that an account's public key matches an expected value but fail to confirm that the account actually **signed** the transaction, attackers can impersonate authorized users without their consent.
 
-This vulnerability occurs when a program checks that an account's pubkey matches an expected value, but fails to verify that the account actually **signed** the transaction. An attacker can pass anyone's pubkey as an account without their consent, bypassing authorization checks.
+---
 
-## Vulnerable Behavior
+## The Vulnerability
+
+### Why This Matters
+
+On Solana, anyone can pass any public key as an account to a program. The `Signer` type is the only mechanism that proves an account owner authorized the transaction. Without it, a pubkey check is merely identity verification, not authorization.
+
+| Check Type | What It Proves | Security Level |
+|------------|----------------|----------------|
+| Pubkey equality | "This is account X" | None - anyone can pass any pubkey |
+| `Signer` constraint | "Account X authorized this" | Secure - requires private key |
+
+The critical distinction: **Pubkey equality is NOT authorization.**
+
+---
+
+## Program Architecture
+
+This demo implements a protocol configuration system with three instructions:
+
+| Instruction | Description |
+|-------------|-------------|
+| `initialize` | Creates the config PDA with an initial admin and fee |
+| `vulnerable_update_fee` | **Vulnerable** - Checks pubkey but not signature |
+| `vulnerable_transfer_admin` | **Vulnerable** - No authorization check at all |
+| `secure_update_fee` | **Secure** - Uses `Signer` + `has_one` constraints |
+
+---
+
+## Vulnerability Analysis
 
 ### Vulnerability 1: Pubkey Check Without Signature
 
-The `vulnerable_update_fee` instruction checks the admin's pubkey but not their signature:
+The `vulnerable_update_fee` instruction checks if the passed account matches the stored admin, but doesn't verify the admin signed:
 
 ```rust
-// ❌ VULNERABLE: Checks pubkey equality, not signature
-require!(
-    config.admin == ctx.accounts.new_admin.key(),
-    ConfigError::Unauthorized
-);
+#[derive(Accounts)]
+pub struct VulnerableUpdateFee<'info> {
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
 
-// new_admin is AccountInfo, not Signer!
-pub new_admin: AccountInfo<'info>,
+    /// CHECK: Unsafe. This allows passing the admin's address without their signature.
+    pub admin_account: AccountInfo<'info>,
+}
+
+pub fn vulnerable_update_fee(ctx: Context<VulnerableUpdateFee>, new_fee_bps: u16) -> Result<()> {
+    let config = &mut ctx.accounts.config;
+
+    // This passes if you send the admin's Public Key, even if they didn't sign!
+    require!(
+        config.admin == ctx.accounts.admin_account.key(),
+        ConfigError::Unauthorized
+    );
+
+    config.fee_bps = new_fee_bps;
+    Ok(())
+}
 ```
 
-**Attack Flow:**
-1. Attacker identifies the stored admin pubkey
-2. Attacker calls `vulnerable_update_fee` with:
-   - `new_admin` = legitimate admin's pubkey (not signing)
-   - `caller` = attacker's pubkey (is signing)
-3. The pubkey check passes, but admin never authorized it!
-4. Attacker changes fees to any value
+### What Goes Wrong
 
-### Vulnerability 2: No Authority Check At All
+| Issue | Consequence |
+|-------|-------------|
+| `AccountInfo` instead of `Signer` | No signature verification |
+| Pubkey equality check only | Attacker can pass admin's pubkey without consent |
+| Admin never signs | Unauthorized fee changes accepted |
 
-The `vulnerable_transfer_admin` instruction has zero authorization:
+### Vulnerability 2: No Authorization At All
+
+The `vulnerable_transfer_admin` instruction has zero authorization checks:
 
 ```rust
-// ❌ CATASTROPHIC: No checks whatsoever
-pub fn vulnerable_transfer_admin(ctx: Context<...>, new_admin: Pubkey) -> Result<()> {
+#[derive(Accounts)]
+pub struct VulnerableTransferAdmin<'info> {
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+pub fn vulnerable_transfer_admin(ctx: Context<VulnerableTransferAdmin>, new_admin: Pubkey) -> Result<()> {
+    let config = &mut ctx.accounts.config;
     config.admin = new_admin;  // Anyone can become admin!
+    Ok(())
 }
 ```
 
-**Attack Flow:**
-1. Attacker calls `vulnerable_transfer_admin(attacker_pubkey)`
-2. Attacker is now the admin
-3. Attacker has complete control of the protocol
+---
 
-## Real-World Context
+## Exploit Mechanism
 
-### Solend Auth Bypass Attempt (August 2021)
-> "An attacker exploited an insecure authentication check in Solend's `UpdateReserveConfig` function. The attacker bypassed admin checks by creating a new lending market and passing it as an account they owned, enabling unauthorized updates to reserve configurations."
+### Attack 1: Fee Manipulation
 
-The attacker manipulated account inputs to bypass authority checks, nearly stealing $2M. The pattern is identical to our `vulnerable_update_fee` - checking account data without verifying signatures.
+```
+Step 1: Identify Target
+---------------------------------------------------------------
+Attacker reads the config account to find the admin pubkey
 
-### Audius Governance Exploit ($6.1M - July 2022)
-> "A vulnerability in Audius' governance program allowed an attacker to submit and execute malicious proposals, bypassing proper validation. The attacker reconfigured treasury permissions, transferring 18.5 million AUDIO tokens."
+Step 2: Craft Malicious Transaction
+---------------------------------------------------------------
+Attacker calls vulnerable_update_fee with:
+  - admin_account = legitimate admin's pubkey (not signing)
+  - new_fee_bps = 999 (9.99% - malicious fee)
 
-Governance systems without proper signer verification allow attackers to submit malicious proposals and execute unauthorized actions.
-
-### Synthetify DAO Exploit ($230K - October 2023)
-> "An attacker exploited Synthetify's inactive DAO by creating and voting on malicious governance proposals... using their own tokens to meet the voting quorum unnoticed."
-
-When DAOs don't properly verify authority and signatures, attackers can take control through carefully crafted transactions.
-
-## Fix Explanation
-
-### Fix 1: Use `Signer` Type
-
-```rust
-// ✅ SECURE: admin must be a Signer
-pub admin: Signer<'info>,
+Step 3: Exploit Succeeds
+---------------------------------------------------------------
+Pubkey check passes -> Fee changed without admin consent
 ```
 
-The `Signer` type in Anchor automatically verifies that the account signed the transaction. Combined with `has_one`:
+### Attack 2: Complete Takeover
 
-```rust
-#[account(
-    has_one = admin @ ConfigError::Unauthorized
-)]
-pub config: Account<'info, Config>,
+```
+Step 1: Call vulnerable_transfer_admin
+---------------------------------------------------------------
+Attacker calls with:
+  - caller = attacker (signing)
+  - new_admin = attacker's pubkey
 
-// This verifies:
-// 1. admin signed the transaction (Signer type)
-// 2. config.admin == admin.key() (has_one constraint)
+Step 2: Exploit Succeeds
+---------------------------------------------------------------
+No authorization check -> Attacker is now admin
+-> Complete protocol control
 ```
 
-### Fix 2: Two-Step Authority Transfer
+---
 
-For critical authority changes, use a two-step process:
+## Secure Implementation
+
+The `secure_update_fee` instruction uses proper Anchor constraints:
 
 ```rust
-pub fn secure_nominate_admin(ctx: Context<...>, new_admin: Pubkey) -> Result<()> {
-    // Current admin nominates (must sign)
-    config.pending_admin = Some(new_admin);
-}
+#[derive(Accounts)]
+pub struct SecureUpdateFee<'info> {
+    #[account(
+        mut,
+        seeds = [b"config"],
+        bump = config.bump,
+        has_one = admin @ ConfigError::Unauthorized
+    )]
+    pub config: Account<'info, Config>,
 
-pub fn secure_accept_admin(ctx: Context<...>) -> Result<()> {
-    // New admin accepts (must sign)
-    require!(config.pending_admin == Some(ctx.accounts.new_admin.key()));
-    config.admin = ctx.accounts.new_admin.key();
-    config.pending_admin = None;
+    pub admin: Signer<'info>,  // Must sign the transaction
 }
 ```
 
-**Benefits:**
-- Prevents accidental transfers to wrong addresses
-- Requires explicit consent from new admin
-- Cannot be completed in a single transaction
-- Provides time for detection and intervention
+### Security Layers
 
-### Why These Fixes Work
+| Constraint | Protection |
+|------------|------------|
+| `Signer<'info>` | Requires the admin's private key to sign |
+| `has_one = admin` | Verifies `config.admin == admin.key()` |
+| Combined | Only the stored admin who signs can update |
 
-| Attack Vector | Vulnerable | Secure |
-|--------------|------------|--------|
-| Pass admin pubkey without signature | ❌ Accepted | ✅ Rejected (Signer) |
-| Attacker signs as different account | ❌ Accepted | ✅ Rejected (has_one) |
-| Direct admin takeover | ❌ Accepted | ✅ Rejected (two-step) |
-| Social engineering single-tx transfer | ❌ Possible | ✅ Prevented (acceptance required) |
+---
 
-## Key Takeaway
+## Real-World Exploits
 
-> **Pubkey equality is NOT authorization.**
-> 
-> The fundamental rule: **Always use `Signer` for any account that authorizes an action.**
-> 
-> A pubkey check only verifies identity, not consent. Anyone can pass anyone else's pubkey as an account - only signature verification proves the owner authorized the transaction.
+Missing authority checks have enabled significant exploits across the Solana ecosystem:
 
-### Security Checklist for Authority
+### 2021
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Solend Auth Bypass (Aug 2021)** | $16K (mitigated) | Attacker exploited an insecure authentication check in Solend's `UpdateReserveConfig` function. By creating a new lending market and passing it as an account they controlled, the attacker bypassed admin checks and modified reserve configurations for USDC, SOL, ETH, and BTC. This allowed lowering liquidation thresholds and inflating liquidation bonuses. |
+
+### 2022
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Audius Governance (Jul 2022)** | $6.1M | Attackers submitted and executed malicious governance proposals without proper authorization. The governance program failed to properly validate proposal submission authority, allowing attackers to reconfigure treasury permissions and drain 18.5 million AUDIO tokens. |
+
+### 2023
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Synthetify DAO (Oct 2023)** | $230K | Attackers exploited an inactive DAO by creating and voting on malicious governance proposals. They submitted 10 proposals (9 harmless, 1 malicious) and used their own tokens to meet voting quorum, transferring treasury funds without proper authority verification. |
+
+### 2024
+
+| Incident | Loss | Description |
+|----------|------|-------------|
+| **Saga DAO (Jan 2024)** | $60K | The DAO's multisig wallet required only 1 of 12 confirmations, allowing an attacker to drain approximately $60,000 in SOL from the treasury. The low confirmation threshold meant a single compromised or malicious signer could authorize transactions. |
+| **Pump.fun (May 2024)** | $1.9M (mitigated) | A former employee exploited their privileged withdrawal authority access to execute a flash loan attack. The program failed to revoke authority after the employee left, demonstrating the need for proper access control lifecycle management. |
+
+### Pattern Analysis
+
+These exploits share common characteristics:
+
+1. **Pubkey Checks Without Signatures** - Programs verified identity but not authorization
+2. **Missing Access Control** - No verification that callers had permission
+3. **Weak Governance Thresholds** - Low quorum or confirmation requirements
+4. **Stale Authority** - Failure to revoke access when no longer needed
+
+---
+
+## Security Checklist
+
+When implementing authority checks:
 
 - [ ] Use `Signer<'info>` for all accounts that authorize actions
 - [ ] Combine `has_one` with `Signer` for stored authority verification
+- [ ] Never use `AccountInfo` for authorization - only for read-only data
 - [ ] Implement two-step processes for critical authority transfers
-- [ ] Never trust `AccountInfo` for authorization - only for read-only data
-- [ ] Log authority changes for auditability
+- [ ] Set appropriate thresholds for multisig operations
+- [ ] Revoke access immediately when authority should be removed
+
+---
 
 ## The Signer vs AccountInfo Distinction
 
 ```rust
-// ❌ DANGEROUS: Anyone can pass any pubkey
+// DANGEROUS: Anyone can pass any pubkey
 pub some_account: AccountInfo<'info>,
 
-// ✅ SAFE: Only the owner of this pubkey can pass it
+// SAFE: Only the owner of this pubkey can pass it (they must sign)
 pub some_account: Signer<'info>,
 ```
 
@@ -150,21 +228,11 @@ pub some_account: Signer<'info>,
 - `AccountInfo` = "Here's a pubkey" (no authorization)
 - `Signer` = "I own this pubkey and I authorize this action"
 
-## Running the Exploit Test
-
-```bash
-cd programs/02_missing_authority_check
-anchor test
-```
-
-The test demonstrates:
-1. Attacker changing fees without admin signature (exploit succeeds)
-2. Attacker becoming admin without authorization (exploit succeeds)
-3. Both attacks failing against secure versions
-4. Two-step admin transfer working correctly
+---
 
 ## Further Reading
 
-- [Anchor Book: Signers](https://www.anchor-lang.com/docs/the-accounts-struct#signer)
+- [Anchor Book: Signers](https://www.anchor-lang.com/docs/the-accounts-struct)
 - [Solana Docs: Transactions and Signatures](https://docs.solana.com/developing/programming-model/transactions)
 - [Neodyme: Missing Signer Checks](https://blog.neodyme.io/posts/solana_common_pitfalls)
+- [Helius: A Hitchhiker's Guide to Solana Program Security](https://www.helius.dev/blog/a-hitchhikers-guide-to-solana-program-security)
